@@ -4,6 +4,7 @@ import time
 import requests
 from typing import List, Optional
 import streamlit as st
+import pandas as pd
 from PIL import Image
 import google.generativeai as genai
 from supabase import create_client, Client
@@ -258,7 +259,7 @@ if photos and API_KEY_READY:
 
             with col_img:
                 st.subheader("📄 Receipt")
-                st.image(image, use_column_width=True)
+                st.image(image, use_container_width=True)
 
             with col_data:
                 # Cache lookup: check session_state first before executing model call
@@ -349,3 +350,162 @@ if photos and API_KEY_READY:
                     st.success(f"✅ Successfully saved {saved_count} receipt(s)!")
                 else:
                     st.warning(f"⚠️ Saved {saved_count} out of {len(all_data)} receipts.")
+
+# =========================================================
+# EXPENSE DASHBOARD & CATEGORY ANALYSIS
+# =========================================================
+
+st.divider()
+st.header("📊 Expense Dashboard")
+
+if SUPABASE_READY:
+
+    try:
+        # Get all saved receipts
+        response = (
+            supabase
+            .table("receipts")
+            .select("*")
+            .order("purchase_date", desc=True)
+            .execute()
+        )
+
+        receipts = response.data or []
+
+        if receipts:
+
+            # Convert to DataFrame
+            df = pd.DataFrame(receipts)
+
+            # Make sure total is numeric
+            df["total"] = pd.to_numeric(
+                df["total"],
+                errors="coerce"
+            ).fillna(0)
+
+            # -------------------------------------------------
+            # TOP METRICS
+            # -------------------------------------------------
+
+            total_spending = df["total"].sum()
+            receipt_count = len(df)
+            average_spending = (
+                total_spending / receipt_count
+                if receipt_count > 0
+                else 0
+            )
+
+            currency = (
+                df["currency"].dropna().iloc[0]
+                if not df["currency"].dropna().empty
+                else "VND"
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            col1.metric(
+                "💰 Total Spending",
+                f"{total_spending:,.0f} {currency}"
+            )
+
+            col2.metric(
+                "🧾 Total Receipts",
+                receipt_count
+            )
+
+            col3.metric(
+                "📊 Average Receipt",
+                f"{average_spending:,.0f} {currency}"
+            )
+
+            # -------------------------------------------------
+            # CATEGORY ANALYSIS
+            # -------------------------------------------------
+
+            st.subheader("🏷️ Spending by Category")
+
+            category_data = (
+                df.groupby("category")["total"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+
+            # Percentage of total spending
+            category_percentage = (
+                category_data / total_spending * 100
+                if total_spending > 0
+                else category_data * 0
+            )
+
+            col_chart, col_details = st.columns([1.5, 1])
+
+            with col_chart:
+                st.bar_chart(category_data)
+
+            with col_details:
+
+                category_table = pd.DataFrame({
+                    "Category": category_data.index,
+                    "Amount": category_data.values,
+                    "Percentage": category_percentage.values
+                })
+
+                category_table["Amount"] = category_table["Amount"].apply(
+                    lambda x: f"{x:,.0f} {currency}"
+                )
+
+                category_table["Percentage"] = category_table[
+                    "Percentage"
+                ].apply(
+                    lambda x: f"{x:.1f}%"
+                )
+
+                st.dataframe(
+                    category_table,
+                    hide_index=True,
+                    use_container_width=True
+                )
+
+            # -------------------------------------------------
+            # SPENDING BREAKDOWN
+            # -------------------------------------------------
+
+            st.subheader("📋 Saved Expenses")
+
+            display_df = df[
+                [
+                    "merchant",
+                    "purchase_date",
+                    "category",
+                    "total",
+                    "currency"
+                ]
+            ].copy()
+
+            display_df.columns = [
+                "Merchant",
+                "Date",
+                "Category",
+                "Total",
+                "Currency"
+            ]
+
+            st.dataframe(
+                display_df,
+                hide_index=True,
+                use_container_width=True
+            )
+
+        else:
+            st.info(
+                "📭 No saved expenses yet. "
+                "Upload and save a receipt to see your dashboard."
+            )
+
+    except Exception as e:
+        st.error(f"❌ Could not load expense dashboard: {e}")
+
+else:
+    st.warning(
+        "⚠️ Connect Supabase to view your expense dashboard."
+    )
