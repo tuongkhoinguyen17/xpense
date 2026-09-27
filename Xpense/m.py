@@ -6,7 +6,13 @@ from typing import List, Optional
 import streamlit as st
 import pandas as pd
 from PIL import Image
-import google.generativeai as genai
+
+for key in list(os.environ.keys()):
+    if "GOOGLE" in key or "GCLOUD" in key or "VERTEX" in key:
+        del os.environ[key]
+
+from google import genai
+from google.genai import types
 from supabase import create_client, Client
 
 # =========================================================
@@ -33,11 +39,16 @@ if "parsed_receipts" not in st.session_state:
 # =========================================================
 try:
     api_key = st.secrets["GEMINI_API_KEY"].strip()
-    genai.configure(api_key=api_key)
+    gemini_client = genai.Client(api_key=api_key)
     API_KEY_READY = True
 except (KeyError, FileNotFoundError):
     API_KEY_READY = False
+    gemini_client = None
     st.warning("⚠️ **Gemini API Key missing!** Add it to `.streamlit/secrets.toml`")
+except Exception as e:
+    API_KEY_READY = False
+    gemini_client = None
+    st.error(f"⚠️ Could not initialize Gemini: {e}")
 
 # =========================================================
 # SUPABASE CONFIGURATION
@@ -68,10 +79,12 @@ with st.sidebar:
     # Model diagnostic tool
     if API_KEY_READY and st.button("🔍 List Available Models"):
         try:
-            models = [
-                m.name for m in genai.list_models() 
-                if 'generateContent' in m.supported_generation_methods
-            ]
+            models = []
+            for m in gemini_client.models.list():
+                name = getattr(m, "name", None)
+                if name:
+                    models.append(name)
+
             st.write("Available models for your API key:")
             st.json(models)
         except Exception as e:
@@ -154,16 +167,21 @@ def extract_receipt_with_vision(image: Image.Image, retries: int = 3) -> Optiona
     Numbers must be raw values without thousands separators. Use a period as decimal separator only when the receipt actually shows decimals.
     """
     
-    model = genai.GenerativeModel('gemini-3.6-flash')
+    if not API_KEY_READY or gemini_client is None:
+        st.error("Gemini API is not configured.")
+        return None
+
+    model_name = "gemini-3.6-flash"
     
     for attempt in range(retries):
         try:
-            response = model.generate_content(
-                [prompt, image],
-                generation_config=genai.GenerationConfig(
+            response = gemini_client.models.generate_content(
+                model=model_name,
+                contents=[prompt, image],
+                config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    temperature=0.0
-                )
+                    temperature=0.0,
+                ),
             )
             
             raw_text = response.text.strip()
