@@ -1,6 +1,6 @@
 streamlit
-google-generativeai
-Pillow
-requests
+google-genai
 supabase
 pandas
+Pillow
+requests
