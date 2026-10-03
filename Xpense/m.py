@@ -196,10 +196,26 @@ def extract_receipt_with_vision(image: Image.Image, retries: int = 3) -> Optiona
             
         except Exception as e:
             err_msg = str(e)
-            if ("429" in err_msg or "ResourceExhausted" in err_msg or "Quota" in err_msg) and attempt < retries - 1:
-                wait_time = (attempt + 1) * 5
-                st.warning(f"⚠️ Quota rate limit hit. Pausing {wait_time}s before retry ({attempt + 1}/{retries})...")
+
+            # Retry temporary Gemini server/rate-limit errors
+            if (
+                "429" in err_msg
+                or "503" in err_msg
+                or "UNAVAILABLE" in err_msg
+                or "ResourceExhausted" in err_msg
+                or "Quota" in err_msg
+            ) and attempt < retries - 1:
+
+                wait_time = 5 * (2 ** attempt)
+
+                st.warning(
+                    f"⚠️ Gemini temporarily unavailable. "
+                    f"Retrying in {wait_time}s "
+                    f"({attempt + 1}/{retries})..."
+                )
+
                 time.sleep(wait_time)
+
             else:
                 st.error(f"Vision API Error: {e}")
                 return None
