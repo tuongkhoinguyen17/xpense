@@ -207,12 +207,175 @@ def extract_receipt_with_vision(image: Image.Image, retries: int = 3) -> Optiona
     return None
 
 # =========================================================
+# USER MANAGEMENT
+# =========================================================
+
+def load_users():
+    """Load all Xpense users from Supabase."""
+    if not SUPABASE_READY:
+        return []
+    try:
+        response = (
+            supabase
+            .table("users")
+            .select("*")
+            .order("name")
+            .execute()
+        )
+        return response.data or []
+    except Exception as e:
+        st.error(f"Could not load users: {e}")
+        return []
+
+
+def create_user(name: str):
+    """Create a new Xpense user and return the created row."""
+    if not SUPABASE_READY:
+        return None
+
+    name = name.strip()
+    if not name:
+        return None
+
+    try:
+        # Avoid creating duplicate names.
+        existing = (
+            supabase
+            .table("users")
+            .select("*")
+            .eq("name", name)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            return existing.data[0]
+
+        response = (
+            supabase
+            .table("users")
+            .insert({"name": name})
+            .execute()
+        )
+
+        return response.data[0] if response.data else None
+
+    except Exception as e:
+        st.error(f"Could not create user: {e}")
+        return None
+
+
+def handle_user_change(users):
+    """Update the selected user immediately when the dropdown changes."""
+    selected_name = st.session_state.user_selector
+
+    if selected_name == "Select an account...":
+        st.session_state.selected_user_id = None
+        st.session_state.selected_user_name = None
+        return
+
+    selected_user = next(
+        (user for user in users if user["name"] == selected_name),
+        None
+    )
+
+    if selected_user:
+        st.session_state.selected_user_id = selected_user["id"]
+        st.session_state.selected_user_name = selected_user["name"]
+
+
+def show_user_selector():
+    """Display the account selection / creation UI."""
+    if not SUPABASE_READY:
+        st.warning("⚠️ Connect Supabase before selecting or creating an account.")
+        return False
+
+    users = load_users()
+
+    st.markdown("## 👤 Choose Your Account")
+    st.caption("Select an existing account or create a new one to continue.")
+
+    # ---------------------------------------------------------
+    # EXISTING ACCOUNTS
+    # ---------------------------------------------------------
+    if users:
+        user_options = ["Select an account..."] + [
+            user["name"] for user in users
+        ]
+
+        current_name = st.session_state.get("selected_user_name")
+
+        if current_name in user_options:
+            default_index = user_options.index(current_name)
+        else:
+            default_index = 0
+
+        st.selectbox(
+            "Existing account",
+            user_options,
+            index=default_index,
+            key="user_selector",
+            on_change=handle_user_change,
+            args=(users,)
+        )
+
+    else:
+        st.info("No accounts exist yet. Create your first account below.")
+
+    # ---------------------------------------------------------
+    # CREATE ACCOUNT
+    # ---------------------------------------------------------
+    with st.expander("➕ Create New Account"):
+        new_user_name = st.text_input(
+            "Account name",
+            placeholder="e.g. Khoi",
+            key="new_user_name"
+        )
+
+        if st.button(
+            "Create Account",
+            type="primary",
+            use_container_width=True
+        ):
+            if not new_user_name.strip():
+                st.warning("Please enter an account name.")
+            else:
+                new_user = create_user(new_user_name)
+
+                if new_user:
+                    st.session_state.selected_user_id = new_user["id"]
+                    st.session_state.selected_user_name = new_user["name"]
+                    st.rerun()
+
+    # ---------------------------------------------------------
+    # CONFIRM SELECTION
+    # ---------------------------------------------------------
+    selected_user_id = st.session_state.get("selected_user_id")
+
+    if selected_user_id:
+        st.success(
+            f"✅ Account selected: **"
+            f"{st.session_state.get('selected_user_name', 'Unknown')}**"
+        )
+        return True
+
+    return False
+
+# =========================================================
 # SAVE RECEIPT TO SUPABASE
 # =========================================================
 
+
 def save_receipt_to_database(data: dict) -> bool:
     try:
+        user_id = st.session_state.get("selected_user_id")
+
+        if not user_id:
+            st.error("Please select a user before saving expenses.")
+            return False
+
         receipt = {
+            "user_id": user_id,
             "merchant": data.get("merchant"),
             "currency": data.get("currency"),
             "purchase_date": data.get("purchase_date"),
@@ -249,281 +412,352 @@ def save_receipt_to_database(data: dict) -> bool:
         return False
 
 # =========================================================
-# MAIN APP FLOW
+# ACCOUNT SELECTION
 # =========================================================
 
-photos = st.file_uploader(
-    "Upload / Take Receipt Photos",
-    type=["jpg", "jpeg", "png", "webp"],
-    accept_multiple_files=True
-)
+if "selected_user_id" not in st.session_state:
+    st.session_state.selected_user_id = None
 
-if photos and API_KEY_READY:
-    st.info(f"📄 {len(photos)} receipt(s) selected")
-    all_data = []
+if "selected_user_name" not in st.session_state:
+    st.session_state.selected_user_name = None
 
-    # Process each uploaded receipt
-    for index, photo in enumerate(photos):
-        st.divider()
-        st.header(f"Receipt {index + 1} of {len(photos)}")
+account_selected = show_user_selector()
 
-        try:
-            image = Image.open(photo)
-            image.thumbnail((1500, 1500))
+# =========================================================
+# RECEIPT UPLOAD + PROCESSING
+# Only render after an account has been selected.
+# =========================================================
 
-            file_id = f"{photo.name}_{photo.size}"
+if account_selected:
 
-            col_img, col_data = st.columns([1, 1.5])
+    st.divider()
 
-            with col_img:
-                st.subheader("📄 Receipt")
-                st.image(image, use_container_width=True)
+    photos = st.file_uploader(
+        "Upload / Take Receipt Photos",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+        key="receipt_uploader"
+    )
 
-            with col_data:
-                # Cache lookup: check session_state first before executing model call
-                if file_id not in st.session_state.parsed_receipts:
-                    with st.spinner(f"🤖 Analyzing receipt {index + 1}..."):
-                        parsed_res = extract_receipt_with_vision(image)
-                        if parsed_res:
-                            st.session_state.parsed_receipts[file_id] = parsed_res
+    if photos and API_KEY_READY:
+        st.info(f"📄 {len(photos)} receipt(s) selected")
+        all_data = []
 
-                data = st.session_state.parsed_receipts.get(file_id)
+        # Process each uploaded receipt
+        for index, photo in enumerate(photos):
+            st.divider()
+            st.header(f"Receipt {index + 1} of {len(photos)}")
 
-                if data:
-                    all_data.append(data)
-                    st.success("Receipt parsed successfully!")
+            try:
+                image = Image.open(photo)
+                image.thumbnail((1500, 1500))
 
-                    # Main Information Metrics
-                    c1, c2 = st.columns(2)
-                    c1.metric("🏪 Merchant", data.get("merchant", "Unknown"))
-                    c2.metric("📅 Date", data.get("purchase_date", "Unknown"))
+                file_id = f"{photo.name}_{photo.size}"
 
-                    c3, c4 = st.columns(2)
-                    currency = data.get("currency", "")
-                    c3.metric("💰 Total", f"{data.get('total', 0):,} {currency}")
-                    c4.metric("🏷️ Category", data.get("category", "📦 Other"))
+                col_img, col_data = st.columns([1, 1.5])
 
-                    # Line Items Table
-                    st.markdown("### 🛒 Line Items")
-                    if data.get("items"):
-                        st.dataframe(data["items"], use_container_width=True)
+                with col_img:
+                    st.subheader("📄 Receipt")
+                    st.image(image, use_container_width=True)
+
+                with col_data:
+                    if file_id not in st.session_state.parsed_receipts:
+                        with st.spinner(f"🤖 Analyzing receipt {index + 1}..."):
+                            parsed_res = extract_receipt_with_vision(image)
+                            if parsed_res:
+                                st.session_state.parsed_receipts[file_id] = parsed_res
+
+                    data = st.session_state.parsed_receipts.get(file_id)
+
+                    if data:
+                        all_data.append(data)
+                        st.success("Receipt parsed successfully!")
+
+                        c1, c2 = st.columns(2)
+                        c1.metric("🏪 Merchant", data.get("merchant", "Unknown"))
+                        c2.metric("📅 Date", data.get("purchase_date", "Unknown"))
+
+                        c3, c4 = st.columns(2)
+                        currency = data.get("currency", "")
+                        c3.metric(
+                            "💰 Total",
+                            f"{data.get('total', 0):,} {currency}"
+                        )
+                        c4.metric(
+                            "🏷️ Category",
+                            data.get("category", "📦 Other")
+                        )
+
+                        st.markdown("### 🛒 Line Items")
+                        if data.get("items"):
+                            st.dataframe(
+                                data["items"],
+                                use_container_width=True
+                            )
+                        else:
+                            st.info("No line items detected.")
+
+                        with st.expander(
+                            "Show Financial Breakdown (Tax/Subtotal)"
+                        ):
+                            st.write(
+                                f"**Subtotal:** "
+                                f"{data.get('subtotal')} {currency}"
+                            )
+                            st.write(
+                                f"**Tax:** {data.get('tax')} {currency}"
+                            )
+                            st.write(
+                                f"**Total:** {data.get('total')} {currency}"
+                            )
                     else:
-                        st.info("No line items detected.")
+                        st.error(
+                            f"❌ Could not analyze receipt {index + 1}"
+                        )
 
-                    # Financial Breakdown
-                    with st.expander("Show Financial Breakdown (Tax/Subtotal)"):
-                        st.write(f"**Subtotal:** {data.get('subtotal')} {currency}")
-                        st.write(f"**Tax:** {data.get('tax')} {currency}")
-                        st.write(f"**Total:** {data.get('total')} {currency}")
+            except Exception as e:
+                st.error(
+                    f"❌ Error opening receipt {index + 1}: {e}"
+                )
+
+        # =====================================================
+        # SUMMARY & SAVING SECTION
+        # =====================================================
+        if all_data:
+            st.divider()
+            st.header("📊 Receipt Summary")
+
+            total_spending = sum(
+                float(receipt.get("total", 0) or 0)
+                for receipt in all_data
+            )
+            currency = all_data[0].get("currency", "")
+
+            c1, c2 = st.columns(2)
+            c1.metric("🧾 Receipts", len(all_data))
+            c2.metric(
+                "💰 Total Spending",
+                f"{total_spending:,.0f} {currency}"
+            )
+
+            st.markdown("### 🧾 All Receipts")
+            summary_data = [
+                {
+                    "Merchant": receipt.get("merchant", "Unknown"),
+                    "Date": receipt.get("purchase_date", "Unknown"),
+                    "Category": receipt.get(
+                        "category",
+                        "📦 Other"
+                    ),
+                    "Total": receipt.get("total", 0),
+                    "Currency": receipt.get("currency", "")
+                }
+                for receipt in all_data
+            ]
+
+            st.dataframe(
+                summary_data,
+                use_container_width=True
+            )
+
+            if st.button(
+                "💾 Save All Expenses",
+                type="primary",
+                use_container_width=True
+            ):
+                if not SUPABASE_READY:
+                    st.error(
+                        "Supabase is not configured. "
+                        "Check `.streamlit/secrets.toml`."
+                    )
                 else:
-                    st.error(f"❌ Could not analyze receipt {index + 1}")
+                    saved_count = 0
 
-        except Exception as e:
-            st.error(f"❌ Error opening receipt {index + 1}: {e}")
+                    with st.spinner(
+                        "💾 Saving expenses to database..."
+                    ):
+                        for receipt in all_data:
+                            success = save_receipt_to_database(receipt)
+                            if success:
+                                saved_count += 1
 
-    # =====================================================
-    # SUMMARY & SAVING SECTION
-    # =====================================================
-    if all_data:
-        st.divider()
-        st.header("📊 Receipt Summary")
+                    if saved_count == len(all_data):
+                        st.success(
+                            f"✅ Successfully saved "
+                            f"{saved_count} receipt(s)!"
+                        )
+                    else:
+                        st.warning(
+                            f"⚠️ Saved {saved_count} out of "
+                            f"{len(all_data)} receipts."
+                        )
 
-        total_spending = sum(
-            float(receipt.get("total", 0) or 0)
-            for receipt in all_data
-        )
-        currency = all_data[0].get("currency", "")
-
-        c1, c2 = st.columns(2)
-        c1.metric("🧾 Receipts", len(all_data))
-        c2.metric("💰 Total Spending", f"{total_spending:,.0f} {currency}")
-
-        # Summary Table
-        st.markdown("### 🧾 All Receipts")
-        summary_data = [
-            {
-                "Merchant": receipt.get("merchant", "Unknown"),
-                "Date": receipt.get("purchase_date", "Unknown"),
-                "Category": receipt.get("category", "📦 Other"),
-                "Total": receipt.get("total", 0),
-                "Currency": receipt.get("currency", "")
-            }
-            for receipt in all_data
-        ]
-        st.dataframe(summary_data, use_container_width=True)
-
-        # Save Action Button
-        if st.button("💾 Save All Expenses", type="primary", use_container_width=True):
-            if not SUPABASE_READY:
-                st.error("Supabase is not configured. Check `.streamlit/secrets.toml`.")
-            else:
-                saved_count = 0
-                with st.spinner("💾 Saving expenses to database..."):
-                    for receipt in all_data:
-                        success = save_receipt_to_database(receipt)
-                        if success:
-                            saved_count += 1
-
-                if saved_count == len(all_data):
-                    st.success(f"✅ Successfully saved {saved_count} receipt(s)!")
-                else:
-                    st.warning(f"⚠️ Saved {saved_count} out of {len(all_data)} receipts.")
 
 # =========================================================
 # EXPENSE DASHBOARD & CATEGORY ANALYSIS
 # =========================================================
 
-st.divider()
-st.header("📊 Expense Dashboard")
+if account_selected:
 
-if SUPABASE_READY:
 
-    try:
-        # Get all saved receipts
-        response = (
-            supabase
-            .table("receipts")
-            .select("*")
-            .order("purchase_date", desc=True)
-            .execute()
-        )
+    st.divider()
+    st.header(f"📊 Expense Dashboard — {st.session_state.get('selected_user_name', 'User')}")
 
-        receipts = response.data or []
+    if SUPABASE_READY:
 
-        if receipts:
+        try:
+            # Get all saved receipts
+            selected_user_id = st.session_state.get("selected_user_id")
 
-            # Convert to DataFrame
-            df = pd.DataFrame(receipts)
+            if not selected_user_id:
+                st.info("👤 Select a user above to view their expense dashboard.")
+                st.stop()
 
-            # Make sure total is numeric
-            df["total"] = pd.to_numeric(
-                df["total"],
-                errors="coerce"
-            ).fillna(0)
-
-            # -------------------------------------------------
-            # TOP METRICS
-            # -------------------------------------------------
-
-            total_spending = df["total"].sum()
-            receipt_count = len(df)
-            average_spending = (
-                total_spending / receipt_count
-                if receipt_count > 0
-                else 0
+            response = (
+                supabase
+                .table("receipts")
+                .select("*")
+                .eq("user_id", selected_user_id)
+                .order("purchase_date", desc=True)
+                .execute()
             )
 
-            currency = (
-                df["currency"].dropna().iloc[0]
-                if not df["currency"].dropna().empty
-                else "VND"
-            )
+            receipts = response.data or []
 
-            col1, col2, col3 = st.columns(3)
+            if receipts:
 
-            col1.metric(
-                "💰 Total Spending",
-                f"{total_spending:,.0f} {currency}"
-            )
+                # Convert to DataFrame
+                df = pd.DataFrame(receipts)
 
-            col2.metric(
-                "🧾 Total Receipts",
-                receipt_count
-            )
+                # Make sure total is numeric
+                df["total"] = pd.to_numeric(
+                    df["total"],
+                    errors="coerce"
+                ).fillna(0)
 
-            col3.metric(
-                "📊 Average Receipt",
-                f"{average_spending:,.0f} {currency}"
-            )
+                # -------------------------------------------------
+                # TOP METRICS
+                # -------------------------------------------------
 
-            # -------------------------------------------------
-            # CATEGORY ANALYSIS
-            # -------------------------------------------------
-
-            st.subheader("🏷️ Spending by Category")
-
-            category_data = (
-                df.groupby("category")["total"]
-                .sum()
-                .sort_values(ascending=False)
-            )
-
-            # Percentage of total spending
-            category_percentage = (
-                category_data / total_spending * 100
-                if total_spending > 0
-                else category_data * 0
-            )
-
-            col_chart, col_details = st.columns([1.5, 1])
-
-            with col_chart:
-                st.bar_chart(category_data)
-
-            with col_details:
-
-                category_table = pd.DataFrame({
-                    "Category": category_data.index,
-                    "Amount": category_data.values,
-                    "Percentage": category_percentage.values
-                })
-
-                category_table["Amount"] = category_table["Amount"].apply(
-                    lambda x: f"{x:,.0f} {currency}"
+                total_spending = df["total"].sum()
+                receipt_count = len(df)
+                average_spending = (
+                    total_spending / receipt_count
+                    if receipt_count > 0
+                    else 0
                 )
 
-                category_table["Percentage"] = category_table[
-                    "Percentage"
-                ].apply(
-                    lambda x: f"{x:.1f}%"
+                currency = (
+                    df["currency"].dropna().iloc[0]
+                    if not df["currency"].dropna().empty
+                    else "VND"
                 )
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric(
+                    "💰 Total Spending",
+                    f"{total_spending:,.0f} {currency}"
+                )
+
+                col2.metric(
+                    "🧾 Total Receipts",
+                    receipt_count
+                )
+
+                col3.metric(
+                    "📊 Average Receipt",
+                    f"{average_spending:,.0f} {currency}"
+                )
+
+                # -------------------------------------------------
+                # CATEGORY ANALYSIS
+                # -------------------------------------------------
+
+                st.subheader("🏷️ Spending by Category")
+
+                category_data = (
+                    df.groupby("category")["total"]
+                    .sum()
+                    .sort_values(ascending=False)
+                )
+
+                # Percentage of total spending
+                category_percentage = (
+                    category_data / total_spending * 100
+                    if total_spending > 0
+                    else category_data * 0
+                )
+
+                col_chart, col_details = st.columns([1.5, 1])
+
+                with col_chart:
+                    st.bar_chart(category_data)
+
+                with col_details:
+
+                    category_table = pd.DataFrame({
+                        "Category": category_data.index,
+                        "Amount": category_data.values,
+                        "Percentage": category_percentage.values
+                    })
+
+                    category_table["Amount"] = category_table["Amount"].apply(
+                        lambda x: f"{x:,.0f} {currency}"
+                    )
+
+                    category_table["Percentage"] = category_table[
+                        "Percentage"
+                    ].apply(
+                        lambda x: f"{x:.1f}%"
+                    )
+
+                    st.dataframe(
+                        category_table,
+                        hide_index=True,
+                        use_container_width=True
+                    )
+
+                # -------------------------------------------------
+                # SPENDING BREAKDOWN
+                # -------------------------------------------------
+
+                st.subheader("📋 Saved Expenses")
+
+                display_df = df[
+                    [
+                        "merchant",
+                        "purchase_date",
+                        "category",
+                        "total",
+                        "currency"
+                    ]
+                ].copy()
+
+                display_df.columns = [
+                    "Merchant",
+                    "Date",
+                    "Category",
+                    "Total",
+                    "Currency"
+                ]
 
                 st.dataframe(
-                    category_table,
+                    display_df,
                     hide_index=True,
                     use_container_width=True
                 )
 
-            # -------------------------------------------------
-            # SPENDING BREAKDOWN
-            # -------------------------------------------------
+            else:
+                st.info(
+                    "📭 No saved expenses yet. "
+                    "Upload and save a receipt to see your dashboard."
+                )
 
-            st.subheader("📋 Saved Expenses")
+        except Exception as e:
+            st.error(f"❌ Could not load expense dashboard: {e}")
 
-            display_df = df[
-                [
-                    "merchant",
-                    "purchase_date",
-                    "category",
-                    "total",
-                    "currency"
-                ]
-            ].copy()
-
-            display_df.columns = [
-                "Merchant",
-                "Date",
-                "Category",
-                "Total",
-                "Currency"
-            ]
-
-            st.dataframe(
-                display_df,
-                hide_index=True,
-                use_container_width=True
-            )
-
-        else:
-            st.info(
-                "📭 No saved expenses yet. "
-                "Upload and save a receipt to see your dashboard."
-            )
-
-    except Exception as e:
-        st.error(f"❌ Could not load expense dashboard: {e}")
-
-else:
-    st.warning(
-        "⚠️ Connect Supabase to view your expense dashboard."
-    )
+    else:
+        st.warning(
+            "⚠️ Connect Supabase to view your expense dashboard."
+        )
